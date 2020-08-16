@@ -1,0 +1,9 @@
+#!/bin/sh
+if [ -z "$1" ]; then
+    echo "usage: wopr-shred-d <secrets dir>"
+    exit 1
+fi
+sudo docker rm -f wopr-discord
+sudo docker run --name wopr-discord -d --restart unless-stopped --network hainet -v $1:/secrets wopr-discord-arm:latest
+sudo docker logs wopr-discord
+

@@ -1,0 +1,11 @@
+#!/bin/sh
+if [ -z "$1" ]; then
+    echo "usage: build <secrets dir>"
+    exit 1
+fi
+
+GHToken=$(cat $1/GithubToken)
+dotnet nuget add source https://nuget.pkg.github.com/infiniterick/index.json -n github -u infiniterick -p $GHToken --store-password-in-clear-text
+dotnet publish -r linux-arm64 -c Release /p:PublishSingleFile=true
+sudo docker build -t wopr-discord-arm .
+
