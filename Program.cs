@@ -6,6 +6,7 @@ using Discord.WebSocket;
 using ServiceStack.Redis;
 using System.Text.Json;
 using Wopr.Core;
+using System.Text;
 
 namespace Wopr.Discord
 {
@@ -155,6 +156,11 @@ namespace Wopr.Discord
             }
         }
 
+        private string FixupEmotes(string emote){
+            //something in the chain is adding an extra escape to the unicode emojis breaking discord
+            return emote.Contains(@"\\u") ? emote.Replace(@"\\u",@"\u") : emote;
+        }
+
         private void ProcessRawControlMessage(string raw){
             try{
                 if(raw.StartsWith("{\"MessageType\":\"AddContent\"")){
@@ -168,7 +174,7 @@ namespace Wopr.Discord
                     var channel = client.GetChannel(Convert.ToUInt64(msg.ChannelId)) as ISocketMessageChannel;
                     if(channel != null){
                         var message = channel.GetMessageAsync(Convert.ToUInt64(msg.MessageId)).Result;
-                        message.AddReactionAsync(new Emoji(msg.Emote)).Wait();
+                        message.AddReactionAsync(new Emoji(FixupEmotes(msg.Emote))).Wait();
                     }
                 }else if(raw.StartsWith("{\"MessageType\":\"RemoveContent\"")){
                     var msg = JsonSerializer.Deserialize<RemoveContent>(raw);
@@ -181,7 +187,7 @@ namespace Wopr.Discord
                     var channel = client.GetChannel(Convert.ToUInt64(msg.ChannelId)) as ISocketMessageChannel;
                     if(channel != null){
                         var message = channel.GetMessageAsync(Convert.ToUInt64(msg.MessageId)).Result;
-                        message.RemoveReactionAsync(new Emoji(msg.Emote), client.CurrentUser);
+                        message.RemoveReactionAsync(new Emoji(FixupEmotes(msg.Emote)), client.CurrentUser);
                     }
                 } else if (raw.StartsWith("{\"MessageType\":\"RemoveAllReactions\"")){
                     var msg = JsonSerializer.Deserialize<RemoveAllReactions>(raw);
