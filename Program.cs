@@ -6,17 +6,22 @@ using Discord.WebSocket;
 using ServiceStack.Redis;
 using System.Text.Json;
 using Wopr.Core;
-using System.Text;
+using MassTransit;
+using System.Threading;
 
 namespace Wopr.Discord
 {
     //https://discord.com/api/oauth2/authorize?client_id=736302317674037288&scope=bot&permissions=8
     public class Program
-    {   
+    {          
         RedisManagerPool redisPool;
         DiscordSocketClient client;
-        IDiscordEventClient woprClient;
-        RedisPubSubServer redisPubSub;
+        IBusControl bus;
+        CancellationTokenSource cancel;
+        string rabbitToken;
+        
+        //replay is dangerous. extra safety
+        bool enableReplay = false;
 
         [STAThread]
         public static void Main(string[] args)
@@ -27,12 +32,18 @@ namespace Wopr.Discord
             var secretsDir = args.Any() ? args[0] : ".";
             var secrets = Secrets.Load(secretsDir);
 
+            if(!string.IsNullOrEmpty(secrets.StackToken)){
+                Console.WriteLine("Running service stack in licensed mode");
+                ServiceStack.Licensing.RegisterLicense(secrets.StackToken);
+            }
+
+            this.rabbitToken = secrets.RabbitToken;
+            cancel = new CancellationTokenSource();
             
 
             redisPool = new RedisManagerPool(secrets.RedisToken);
-            woprClient = new DiscordEventClient(redisPool);
             client = new DiscordSocketClient(new DiscordSocketConfig(){LogLevel = LogSeverity.Error});
-	        client.Log += Log;
+	        client.Log += DiscordLog;
             client.Connected += Connected;
             client.Disconnected += Disconnected;
             client.MessageReceived +=  MessageReceived;
@@ -43,169 +54,225 @@ namespace Wopr.Discord
             client.ReactionAdded += ReactionAdded;
             client.ReactionRemoved += ReactionRemoved;
 
-            redisPubSub = new RedisPubSubServer(redisPool, RedisPaths.ControlReady); 
-            redisPubSub.OnMessage += NewControlReady;
+            Console.CancelKeyPress += (s, e) => {
+                client.LogoutAsync().Wait();
+                bus.Stop();
+                cancel.Cancel();
+            };
+
+            await StartMassTransit();
 
         	await client.LoginAsync(TokenType.Bot,  secrets.DiscordToken);
 	        await client.StartAsync();
-            await Task.Delay(-1);            
-            
-            
-            
+            cancel.Token.WaitHandle.WaitOne();
         }
 
+        private Task StartMassTransit(){
+            bus = Bus.Factory.CreateUsingRabbitMq(sbc =>
+            {
+                var parts = rabbitToken.Split('@');
+                sbc.Host(new Uri(parts[2]), cfg => {
+                    cfg.Username(parts[0]);
+                    cfg.Password(parts[1]);
+                });
+                rabbitToken = string.Empty;
 
-        private void PrimeControlPlane(){
+                sbc.ReceiveEndpoint("wopr:discord", ep =>
+                {
+                    ep.Consumer<AddContentConsumer>(()=>{return new AddContentConsumer(client);});
+                    ep.Consumer<RemoveContentConsumer>(()=>{return new RemoveContentConsumer(client);});
+                    ep.Consumer<AddReactionConsumer>(()=>{return new AddReactionConsumer(client);});
+                    ep.Consumer<RemoveReactionConsumer>(()=>{return new RemoveReactionConsumer(client);});
+                    ep.Consumer<RemoveAllReactionsConsumer>(()=>{return new RemoveAllReactionsConsumer(client);});
+                });
+            });
+
+            return bus.StartAsync(); // This is important!
+        }
+
+        private async Task ReplayBackup(){
+            if(!this.enableReplay)
+                return;
+
             using(var client = redisPool.GetClient()){
-                client.PublishMessage(RedisPaths.ControlReady, "init");
+                foreach(var item in client.GetRangeFromSortedSet(RedisPaths.DiscordBackup, 0, -1)){
+                    if(item.StartsWith("{\"MessageType\":\"UserUpdated\"")){
+                        var msg = JsonSerializer.Deserialize<UserUpdated>(item);
+                        await bus.Publish(msg);
+                    }
+                    else if(item.StartsWith("{\"MessageType\":\"ContentReceived\"") || item.StartsWith("{\"MessageType\":\"ContentUpdated\"")){
+                        var msg = JsonSerializer.Deserialize<ContentReceived>(item);
+                        await bus.Publish(msg);
+                    }
+                    else if(item.StartsWith("{\"MessageType\":\"ReactionAdded\"")){
+                        var msg = JsonSerializer.Deserialize<ReactionAdded>(item);
+                        await bus.Publish(msg);
+
+                    }
+                    else if(item.StartsWith("{\"MessageType\":\"ReactionRemoved\"")){
+                        var msg = JsonSerializer.Deserialize<ReactionRemoved>(item);
+                        await bus.Publish(msg);
+
+                    }
+                    else if(item.StartsWith("{\"MessageType\":\"Connected\"")){
+                        var msg = JsonSerializer.Deserialize<Connected>(item);
+                        await bus.Publish(msg);
+
+                    }
+                    else if(item.StartsWith("{\"MessageType\":\"Disconnected\"")){
+                        var msg = JsonSerializer.Deserialize<Disconnected>(item);
+                        await bus.Publish(msg);
+
+                    }
+                }
             }
         }
         
         private Task Connected(){
-            redisPubSub.Start();
-            PrimeControlPlane();
-            return woprClient.OnConnected();
+            var msg = new Core.Connected(){
+                MessageType = "Connected",
+                Timestamp = DateTime.UtcNow,
+            };
+            
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<Connected>(msg);
         }
 
         private Task Disconnected(Exception ex){
-            redisPubSub.Stop();
-            return woprClient.OnDisconnected(ex);
+            var msg = new Core.Disconnected(){
+                MessageType = "Disconnected",
+                Timestamp = DateTime.UtcNow,
+                ExtraInfo = ex.Message
+            };
+
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<Disconnected>(msg);        
         }
         
         private Task ReactionAdded(Cacheable<IUserMessage, ulong> message, ISocketMessageChannel channel, SocketReaction reaction){
-            return woprClient.OnReactionAdded(
-                new NamedEntity(channel.Id, channel.Name),
-                message.Id.ToString(),
-                reaction.Emote.Name
-            );
+            var msg = new Core.ReactionAdded(){
+                MessageType = "ReactionAdded",
+                Timestamp = DateTime.UtcNow,
+                Channel = new NamedEntity(channel.Id, channel.Name),
+                MessageId = message.Id.ToString(),
+                Emote = reaction.Emote.Name
+            };
+
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<ReactionAdded>(msg);
         }
 
         private Task ReactionRemoved(Cacheable<IUserMessage, ulong> message, ISocketMessageChannel channel, SocketReaction reaction){
-            return woprClient.OnReactionRemoved(
-                new NamedEntity(channel.Id, channel.Name),
-                message.Id.ToString(),
-                reaction.Emote.Name
-            );
+            var msg = new Core.ReactionRemoved(){
+                MessageType = "ReactionRemoved",
+                Timestamp = DateTime.UtcNow,
+                Channel = new NamedEntity(channel.Id, channel.Name),
+                MessageId = message.Id.ToString(),
+                Emote = reaction.Emote.Name
+            };
+
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<ReactionRemoved>(msg);
         }
 
         private Task MessageReceived(SocketMessage message){
-            return woprClient.OnContentReceived(
-                message.Id.ToString(),
-                new NamedEntity(message.Channel.Id, message.Channel.Name),
-                new NamedEntity(message.Author.Id, message.Author.Username),
-                message.Content,
-                message.Attachments?.FirstOrDefault()?.Url
-            );
+            var msg = new Core.ContentReceived(){
+                MessageType = "ContentReceived",
+                Timestamp = DateTime.UtcNow,
+                MessageId = message.Id.ToString(),
+                Channel = new NamedEntity(message.Channel.Id, message.Channel.Name),
+                Author = new NamedEntity(message.Author.Id, message.Author.Username),
+                Content = message.Content,
+                AttatchmentUri = message.Attachments?.FirstOrDefault()?.Url
+            };
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<ContentReceived>(msg);
         }
 
         private Task MessageUpdated(Cacheable<IMessage, ulong> original, SocketMessage message, ISocketMessageChannel channel){
-            return woprClient.OnContentUpdated(
-                message.Id.ToString(),
-                original.Id.ToString(),
-                new NamedEntity(message.Channel.Id, message.Channel.Name),
-                new NamedEntity(message.Author.Id, message.Author.Username),
-                message.Content,
-                message.Attachments?.FirstOrDefault()?.Url
-            );
+            var msg = new Core.ContentUpdated(){
+                MessageType = "ContentUpdated",
+                Timestamp = DateTime.UtcNow,
+                MessageId = message.Id.ToString(),
+                OriginalId = original.Id.ToString(),
+                Channel = new NamedEntity(message.Channel.Id, message.Channel.Name),
+                Author = new NamedEntity(message.Author.Id, message.Author.Username),
+                Content = message.Content,
+                AttatchmentUri = message.Attachments?.FirstOrDefault()?.Url
+            };
+
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<ContentUpdated>(msg);
         }
 
         private Task MessageDeleted(Cacheable<IMessage, ulong> original, ISocketMessageChannel channel){
-            return woprClient.OnContentDeleted(
-                original.Id.ToString(),
-                new NamedEntity(channel.Id, channel.Name)
-            );
+            var msg = new Core.ContentDeleted(){
+                MessageType = "ContentDeleted",
+                Timestamp = DateTime.UtcNow,
+                OriginalId = original.Id.ToString(),
+                Channel = new NamedEntity(channel.Id, channel.Name)
+            };
+
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<ContentDeleted>(msg);
         }
 
         private Task UserUpdated(SocketUser original, SocketUser changed){
-            return woprClient.OnUserUpdated(
-                new NamedEntity(null, null),
-                new NamedEntity(changed.Id, changed.Username),
-                changed.Status.ToString(),
-                new Activity(){
-                    Name = changed.Activity.Name,
-                    Type = changed.Activity.Type.ToString(),
-                    Details = changed.Activity.Details
+            var msg = new Core.UserUpdated(){
+                MessageType = "UserUpdated",
+                Timestamp = DateTime.UtcNow,
+                Guild = new NamedEntity(null, null),
+                User = new NamedEntity(changed.Id, changed.Username),
+                Status = changed.Status.ToString(),
+                Activity = new Activity(){
+                    Name = changed.Activity?.Name,
+                    Type = changed.Activity?.Type.ToString(),
+                    Details = changed.Activity?.Details
                 }
-            );
+            };
+
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<UserUpdated>(msg);
         }
 
         private Task GuildMemberUpdated(SocketGuildUser original, SocketGuildUser changed){
-            return woprClient.OnUserUpdated(
-                new NamedEntity(changed.Guild.Id, changed.Guild.Name),
-                new NamedEntity(changed.Id, changed.Username),
-                changed.Status.ToString(),
-                new Activity(){
+            var msg = new Core.UserUpdated(){
+                MessageType = "UserUpdated",
+                Timestamp = DateTime.UtcNow,
+                Guild = new NamedEntity(changed.Guild.Id, changed.Guild.Name),
+                User = new NamedEntity(changed.Id, changed.Username),
+                Status = changed.Status.ToString(),
+                Activity = new Activity(){
                     Name = changed?.Activity?.Name,
                     Type = changed?.Activity?.Type.ToString(),
                     Details = changed?.Activity?.Details
                 }
-            );
+            };
+
+            Log(msg.MessageType);
+            ArchiveMessage(msg.Timestamp, JsonSerializer.Serialize(msg));
+            return bus.Publish<UserUpdated>(msg);
         }
 
-        ///Redis pubsub will call this when new control messages are available in the fresh list
-        private void NewControlReady(string channel, string message){
-            var raw = string.Empty;
+        private void ArchiveMessage(DateTime timestamp, string json){
             using(var client = redisPool.GetClient()){
-                do{
-                    raw = client.PopAndPushItemBetweenLists(RedisPaths.ControlFresh, RedisPaths.ControlProcessed);
-                    if(!string.IsNullOrEmpty(raw)){
-                        ProcessRawControlMessage(raw);
-                    }
-                }
-                while(!string.IsNullOrEmpty(raw));
+                client.AddItemToSortedSet(RedisPaths.DiscordBackup, json, timestamp.Ticks);
             }
         }
 
-        private string FixupEmotes(string emote){
-            //something in the chain is adding an extra escape to the unicode emojis breaking discord
-            return emote.Contains(@"\\u") ? emote.Replace(@"\\u",@"\u") : emote;
+        private void Log(string message){
+            Console.WriteLine($"{DateTime.UtcNow}|{message}");
         }
 
-        private void ProcessRawControlMessage(string raw){
-            try{
-                if(raw.StartsWith("{\"MessageType\":\"AddContent\"")){
-                    var msg = JsonSerializer.Deserialize<AddContent>(raw);
-                    var channel = client.GetChannel(Convert.ToUInt64(msg.ChannelId)) as ISocketMessageChannel;
-                    if(channel != null){
-                        channel.SendMessageAsync(msg.Content);
-                    }
-                }else if (raw.StartsWith("{\"MessageType\":\"AddReaction\"")){
-                    var msg = JsonSerializer.Deserialize<AddReaction>(raw);
-                    var channel = client.GetChannel(Convert.ToUInt64(msg.ChannelId)) as ISocketMessageChannel;
-                    if(channel != null){
-                        var message = channel.GetMessageAsync(Convert.ToUInt64(msg.MessageId)).Result;
-                        message.AddReactionAsync(new Emoji(FixupEmotes(msg.Emote))).Wait();
-                    }
-                }else if(raw.StartsWith("{\"MessageType\":\"RemoveContent\"")){
-                    var msg = JsonSerializer.Deserialize<RemoveContent>(raw);
-                    var channel = client.GetChannel(Convert.ToUInt64(msg.ChannelId)) as ISocketMessageChannel;
-                    if(channel != null){
-                        channel.DeleteMessageAsync(Convert.ToUInt64(msg.MessageId)).Wait();
-                    }
-                }else if (raw.StartsWith("{\"MessageType\":\"RemoveReaction\"")){
-                    var msg = JsonSerializer.Deserialize<AddReaction>(raw);
-                    var channel = client.GetChannel(Convert.ToUInt64(msg.ChannelId)) as ISocketMessageChannel;
-                    if(channel != null){
-                        var message = channel.GetMessageAsync(Convert.ToUInt64(msg.MessageId)).Result;
-                        message.RemoveReactionAsync(new Emoji(FixupEmotes(msg.Emote)), client.CurrentUser);
-                    }
-                } else if (raw.StartsWith("{\"MessageType\":\"RemoveAllReactions\"")){
-                    var msg = JsonSerializer.Deserialize<RemoveAllReactions>(raw);
-                    var channel = client.GetChannel(Convert.ToUInt64(msg.ChannelId)) as ISocketMessageChannel;
-                    if(channel != null){
-                        var message = channel.GetMessageAsync(Convert.ToUInt64(msg.MessageId)).Result;
-                        message.RemoveAllReactionsAsync().Wait();
-                    }
-                }
-
-            }
-            catch(Exception ex){
-               Console.WriteLine("Exception handling control message: " + ex.Message);
-                throw;
-            }
-        }
-
-        private Task Log(LogMessage msg){
+        private Task DiscordLog(LogMessage msg){
             Console.WriteLine(msg.ToString());
             return Task.CompletedTask;
         }
